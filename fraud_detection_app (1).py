@@ -1,183 +1,247 @@
-
+# app.py
+import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.ensemble import VotingClassifier
+import pickle
+from pathlib import Path
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 import xgboost as xgb
 from sklearn.metrics import classification_report, roc_auc_score
-import streamlit as st
-import pickle
-import os
 
-# Function to preprocess datetime column
+DATA_DIR = Path("Model files")  # recommended place to keep model files and pickles
+
+st.set_page_config(page_title="Credit Card Fraud Detection", layout="centered")
+
+@st.cache_data
+def load_csv_safe(path: Path):
+    return pd.read_csv(path)
+
 def preprocess_datetime(df, column='trans_date_trans_time'):
-    df[column] = pd.to_datetime(df[column])
-    df['hour'] = df[column].dt.hour
-    df['day_of_week'] = df[column].dt.dayofweek
-    df['month'] = df[column].dt.month
-    return df.drop(columns=[column])
+    df = df.copy()
+    df[column] = pd.to_datetime(df[column], errors='coerce')
+    df['hour'] = df[column].dt.hour.fillna(0).astype(int)
+    df['day_of_week'] = df[column].dt.dayofweek.fillna(0).astype(int)
+    df['month'] = df[column].dt.month.fillna(0).astype(int)
+    if column in df.columns:
+        df = df.drop(columns=[column])
+    return df
 
-# Function to load and preprocess data
-def load_and_preprocess_data(train_path, test_path):
-    # Load datasets
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    
-    # Combine for consistent preprocessing
-    df = pd.concat([train_df, test_df], axis=0)
-    
-    # Handle missing values
-    df.fillna(0, inplace=True)
-    
-    # Preprocess datetime column
-    if 'trans_date_trans_time' in df.columns:
-        df = preprocess_datetime(df, 'trans_date_trans_time')
-    
-    # Define categorical and numerical columns (adjust based on your dataset)
-    categorical_cols = ['merchant', 'category', 'gender', 'city', 'state', 'job']  # Example
-    numerical_cols = ['amt', 'lat', 'long', 'city_pop', 'hour', 'day_of_week', 'month']
-    
-    # Encode categorical variables
+def load_pretrained():
+    """Load model, scaler, encoders, and feature columns if available"""
+    model_path = DATA_DIR / "hybrid_model.pkl"
+    scaler_path = DATA_DIR / "scaler.pkl"
+    encoders_path = DATA_DIR / "label_encoders.pkl"
+    features_path = DATA_DIR / "feature_columns.pkl"
+
+    if not model_path.exists():
+        return None
+
+    with open(model_path, "rb") as f:
+        model = pickle.load(f)
+    scaler = None
+    label_encoders = {}
+    feature_columns = None
+    if scaler_path.exists():
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+    if encoders_path.exists():
+        with open(encoders_path, "rb") as f:
+            label_encoders = pickle.load(f)
+    if features_path.exists():
+        with open(features_path, "rb") as f:
+            feature_columns = pickle.load(f)
+
+    return dict(
+        model=model,
+        scaler=scaler,
+        label_encoders=label_encoders,
+        feature_columns=feature_columns,
+    )
+
+def train_and_save(train_path: Path, test_path: Path):
+    st.info("Training models — this runs only if no saved model found and CSVs exist.")
+    train_df = load_csv_safe(train_path)
+    test_df = load_csv_safe(test_path)
+
+    # basic cleaning
+    df_all = pd.concat([train_df, test_df], ignore_index=True)
+    df_all.fillna(0, inplace=True)
+
+    if 'trans_date_trans_time' in df_all.columns:
+        df_all = preprocess_datetime(df_all, 'trans_date_trans_time')
+
+    # Example lists: customize to match your dataset columns
+    categorical_cols = [c for c in ['merchant', 'category', 'gender', 'city', 'state', 'job'] if c in df_all.columns]
+    numerical_cols = [c for c in ['amt', 'lat', 'long', 'city_pop', 'hour', 'day_of_week', 'month'] if c in df_all.columns]
+
+    # Encode categorical
     label_encoders = {}
     for col in categorical_cols:
-        if col in df.columns:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-            label_encoders[col] = le
-    
-    # Scale numerical features
-    scaler = StandardScaler()
-    existing_numerical_cols = [col for col in numerical_cols if col in df.columns]
-    if existing_numerical_cols:
-        df[existing_numerical_cols] = scaler.fit_transform(df[existing_numerical_cols])
-    
-    # Split back into train and test
-    train_df = df.iloc[:len(train_df)]
-    test_df = df.iloc[len(train_df):]
-    
-    return train_df, test_df, label_encoders, scaler
+        le = LabelEncoder()
+        df_all[col] = le.fit_transform(df_all[col].astype(str))
+        label_encoders[col] = le
 
-# Function to train models
-def train_models(X_train, y_train):
-    # Initialize models
+    # Scale numerical
+    scaler = StandardScaler()
+    if numerical_cols:
+        df_all[numerical_cols] = scaler.fit_transform(df_all[numerical_cols])
+
+    # split back
+    train_len = len(train_df)
+    train_processed = df_all.iloc[:train_len].reset_index(drop=True)
+    test_processed = df_all.iloc[train_len:].reset_index(drop=True)
+
+    # Target and features
+    if 'is_fraud' not in train_processed.columns:
+        st.error("Train CSV must contain 'is_fraud' column.")
+        return None
+
+    exclude = {'is_fraud', 'first', 'last', 'street', 'dob', 'trans_num'}
+    feature_cols = [c for c in train_processed.columns if c not in exclude]
+
+    X_train = train_processed[feature_cols]
+    y_train = train_processed['is_fraud']
+    X_test = test_processed[feature_cols] if 'is_fraud' in test_processed.columns else None
+    y_test = test_processed['is_fraud'] if 'is_fraud' in test_processed.columns else None
+
+    # Models
     rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
     xgb_model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
-    
-    # Train individual models
+
     rf_model.fit(X_train, y_train)
     xgb_model.fit(X_train, y_train)
-    
-    # Create hybrid model (Voting Classifier)
-    hybrid_model = VotingClassifier(
-        estimators=[('rf', rf_model), ('xgb', xgb_model)],
-        voting='soft'
-    )
-    hybrid_model.fit(X_train, y_train)
-    
-    return rf_model, xgb_model, hybrid_model
 
-# Function to evaluate models
-def evaluate_models(models, X_test, y_test):
-    for name, model in models.items():
-        y_pred = model.predict(X_test)
-        print(f"\n{name} Performance:")
-        print(classification_report(y_test, y_pred))
-        print(f"ROC AUC Score: {roc_auc_score(y_test, y_pred)}")
+    hybrid = VotingClassifier(estimators=[('rf', rf_model), ('xgb', xgb_model)], voting='soft')
+    hybrid.fit(X_train, y_train)
 
-# Streamlit app
+    # Save artifacts
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DATA_DIR / "hybrid_model.pkl", "wb") as f:
+        pickle.dump(hybrid, f)
+    with open(DATA_DIR / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+    with open(DATA_DIR / "label_encoders.pkl", "wb") as f:
+        pickle.dump(label_encoders, f)
+    with open(DATA_DIR / "feature_columns.pkl", "wb") as f:
+        pickle.dump(feature_cols, f)
+
+    # Evaluate if test labels exist
+    if X_test is not None and y_test is not None:
+        preds = hybrid.predict(X_test)
+        try:
+            probs = hybrid.predict_proba(X_test)[:, 1]
+            roc = roc_auc_score(y_test, probs)
+        except Exception:
+            roc = roc_auc_score(y_test, preds)
+        st.subheader("Evaluation on test set")
+        st.text(classification_report(y_test, preds))
+        st.write("ROC AUC (approx):", roc)
+    st.success("Training completed and artifacts saved to 'Model files/'")
+    return dict(model=hybrid, scaler=scaler, label_encoders=label_encoders, feature_columns=feature_cols)
+
+def safe_encode_input(df, label_encoders):
+    df = df.copy()
+    for col, le in label_encoders.items():
+        if col in df.columns:
+            val = df.at[0, col]
+            try:
+                df[col] = le.transform([str(val)])[0]
+            except Exception:
+                # unseen category: map to 0 and warn
+                df[col] = 0
+                st.warning(f"Input value for '{col}' was unseen in training; encoded as 0.")
+    return df
+
 def main():
     st.title("Credit Card Fraud Detection")
     st.write("Enter transaction details to predict if it's fraudulent.")
-    
-    # Load and preprocess data
-    train_path = "FraudTrain.csv"
-    test_path = "FraudTest.csv"
-    
-    if not os.path.exists('hybrid_model.pkl'):
-        train_df, test_df, label_encoders, scaler = load_and_preprocess_data(train_path, test_path)
-        
-        # Prepare features and target
-        feature_cols = [col for col in train_df.columns if col not in ['is_fraud', 'trans_date_trans_time', 'first', 'last', 'street', 'dob', 'trans_num']]  # Exclude irrelevant columns
-        X_train = train_df[feature_cols]
-        y_train = train_df['is_fraud']
-        X_test = test_df[feature_cols]
-        y_test = test_df['is_fraud']
-        
-        # Train models
-        rf_model, xgb_model, hybrid_model = train_models(X_train, y_train)
-        
-        # Save models and preprocessing objects
-        with open('hybrid_model.pkl', 'wb') as f:
-            pickle.dump(hybrid_model, f)
-        with open('scaler.pkl', 'wb') as f:
-            pickle.dump(scaler, f)
-        with open('label_encoders.pkl', 'wb') as f:
-            pickle.dump(label_encoders, f)
-        
-        # Evaluate models
-        models = {'Random Forest': rf_model, 'XGBoost': xgb_model, 'Hybrid Model': hybrid_model}
-        evaluate_models(models, X_test, y_test)
-    else:
-        # Load models and preprocessing objects
-        with open('hybrid_model.pkl', 'rb') as f:
-            hybrid_model = pickle.load(f)
-        with open('scaler.pkl', 'rb') as f:
-            scaler = pickle.load(f)
-        with open('label_encoders.pkl', 'rb') as f:
-            label_encoders = pickle.load(f)
-    
-    # User input form
-    st.subheader("Transaction Details")
-    input_data = {}
-    
-    # Input fields (adjusted based on typical fraud dataset)
-    input_data['amt'] = st.number_input("Transaction Amount", min_value=0.0, value=100.0)
-    input_data['merchant'] = st.text_input("Merchant", value="merchant_1")
-    input_data['category'] = st.selectbox("Category", options=['gas_transport', 'grocery_pos', 'travel', 'other'])
-    input_data['gender'] = st.selectbox("Gender", options=['M', 'F'])
-    input_data['city'] = st.text_input("City", value="New York")
-    input_data['state'] = st.text_input("State", value="NY")
-    input_data['job'] = st.text_input("Job", value="Engineer")
-    input_data['lat'] = st.number_input("Latitude", value=40.0)
-    input_data['long'] = st.number_input("Longitude", value=-74.0)
-    input_data['city_pop'] = st.number_input("City Population", min_value=0, value=100000)
-    input_data['hour'] = st.number_input("Transaction Hour", min_value=0, max_value=23, value=12)
-    input_data['day_of_week'] = st.number_input("Day of Week (0=Mon, 6=Sun)", min_value=0, max_value=6, value=0)
-    input_data['month'] = st.number_input("Month", min_value=1, max_value=12, value=1)
-    
-    if st.button("Predict"):
-        # Preprocess input
-        input_df = pd.DataFrame([input_data])
-        
-        # Encode categorical variables
-        for col, le in label_encoders.items():
-            if col in input_df.columns:
-                try:
-                    input_df[col] = le.transform(input_df[col].astype(str))
-                except:
-                    input_df[col] = 0  # Handle unseen categories
-        
-        # Scale numerical features
-        numerical_cols = ['amt', 'lat', 'long', 'city_pop', 'hour', 'day_of_week', 'month']
-        existing_numerical_cols = [col for col in numerical_cols if col in input_df.columns]
-        if existing_numerical_cols:
-            input_df[existing_numerical_cols] = scaler.transform(input_df[existing_numerical_cols])
-        
-        # Ensure input_df has the same columns as training data
-        feature_cols = [col for col in hybrid_model.estimators_[0].feature_names_in_]
-        input_df = input_df.reindex(columns=feature_cols, fill_value=0)
-        
-        # Predict
-        prediction = hybrid_model.predict(input_df)
-        prediction_prob = hybrid_model.predict_proba(input_df)[0]
-        
-        # Display result
-        if prediction[0] == 1:
-            st.error(f"Fraudulent Transaction! (Confidence: {prediction_prob[1]:.2%})")
+
+    model_bundle = load_pretrained()
+    # if not found, try to train if CSVs exist in repo root
+    if model_bundle is None:
+        train_path = Path("FraudTrain.csv")
+        test_path = Path("FraudTest.csv")
+        if train_path.exists() and test_path.exists():
+            model_bundle = train_and_save(train_path, test_path)
         else:
-            st.success(f"Legitimate Transaction (Confidence: {prediction_prob[0]:.2%})")
+            st.warning("No saved model found and training CSVs not present in repo.")
+            st.info("To deploy quickly: train locally and upload files into 'Model files/' or upload 'hybrid_model.pkl', 'scaler.pkl', 'label_encoders.pkl', 'feature_columns.pkl'.")
+            st.stop()
+
+    model = model_bundle["model"]
+    scaler = model_bundle.get("scaler")
+    label_encoders = model_bundle.get("label_encoders", {})
+    feature_cols = model_bundle.get("feature_columns")
+
+    # User input
+    st.subheader("Transaction Details")
+    with st.form("tx_form"):
+        amt = st.number_input("Transaction Amount", min_value=0.0, value=100.0)
+        merchant = st.text_input("Merchant", value="merchant_1")
+        category = st.selectbox("Category", options=['gas_transport', 'grocery_pos', 'travel', 'other'])
+        gender = st.selectbox("Gender", options=['M', 'F'])
+        city = st.text_input("City", value="New York")
+        state = st.text_input("State", value="NY")
+        job = st.text_input("Job", value="Engineer")
+        lat = st.number_input("Latitude", value=40.0, format="%.6f")
+        long = st.number_input("Longitude", value=-74.0, format="%.6f")
+        city_pop = st.number_input("City Population", min_value=0, value=100000)
+        hour = st.slider("Transaction Hour", 0, 23, 12)
+        day_of_week = st.slider("Day of Week (0=Mon, 6=Sun)", 0, 6, 0)
+        month = st.slider("Month", 1, 12, 1)
+        submitted = st.form_submit_button("Predict")
+
+    if submitted:
+        input_dict = {
+            "amt": amt,
+            "merchant": merchant,
+            "category": category,
+            "gender": gender,
+            "city": city,
+            "state": state,
+            "job": job,
+            "lat": lat,
+            "long": long,
+            "city_pop": city_pop,
+            "hour": hour,
+            "day_of_week": day_of_week,
+            "month": month,
+        }
+        input_df = pd.DataFrame([input_dict])
+
+        # encode categorical using saved encoders (unseen -> 0)
+        input_df = safe_encode_input(input_df, label_encoders)
+
+        # scale numeric
+        num_cols = [c for c in ['amt', 'lat', 'long', 'city_pop', 'hour', 'day_of_week', 'month'] if c in input_df.columns]
+        if scaler is not None and num_cols:
+            try:
+                input_df[num_cols] = scaler.transform(input_df[num_cols])
+            except Exception as e:
+                st.warning("Scaler transform failed: " + str(e))
+
+        # align columns
+        if feature_cols is None:
+            # fallback: use model's first estimator feature names if available
+            try:
+                feature_cols = list(model.estimators_[0].feature_names_in_)
+            except Exception:
+                feature_cols = list(input_df.columns)  # last resort
+
+        input_df = input_df.reindex(columns=feature_cols, fill_value=0)
+
+        try:
+            pred = model.predict(input_df)
+            proba = model.predict_proba(input_df)[0]
+        except Exception as e:
+            st.error("Prediction failed: " + str(e))
+            return
+
+        if pred[0] == 1:
+            st.error(f"Fraudulent Transaction! (Confidence: {proba[1]:.2%})")
+        else:
+            st.success(f"Legitimate Transaction (Confidence: {proba[0]:.2%})")
 
 if __name__ == "__main__":
     main()
