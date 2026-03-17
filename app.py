@@ -5,8 +5,8 @@ from datetime import datetime
 import uuid
 
 # Load model and label encoders
-model = joblib.load('hybrid_model.pkl')
-label_encoders = joblib.load('label_encoders.pkl')
+model = joblib.load('Model files/hybrid_model.pkl')
+label_encoders = joblib.load('Model files/label_encoders.pkl')
 
 # Streamlit app
 st.title("Credit Card Fraud Detection")
